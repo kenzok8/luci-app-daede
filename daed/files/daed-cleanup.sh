@@ -6,8 +6,37 @@
 #   2. The `daens` network namespace itself (ip netns del, with
 #      umount+rm as fallback for zombie nsfs mounts)
 #   3. The `dae0` veth pair in the host netns
-#   4. Pinned eBPF programs and maps under /sys/fs/bpf/daed
-#   5. The /sys/fs/bpf/daed directory itself
+#
+# What this script intentionally does NOT do:
+#
+#   It does NOT try to detach the eBPF tc clsact filter that daed
+#   pins on br-lan / dae0 ingress. The detach path lives inside
+#   the daed userspace process itself (`ControlPlane.DetachBpfHooks`
+#   → `netlink.FilterDel` / `tc qdisc del dev <iface> clsact`,
+#   control/control_plane_core.go:228, control/bpf_purge.go:30-41).
+#   `bpftool prog detach` is the wrong tool: it only handles the
+#   attach types the kernel exposes through bpf_iter / bpf_link
+#   (sk_msg_verdict, sk_skb_verdict, sk_skb_stream_verdict,
+#   sk_skb_stream_parser, flow_dissector), and daed's hooks are
+#   attached via `netlink.FilterAdd` as TC clsact filters, which
+#   are not on that list. kenzok8 confirmed this on PR
+#   kenzok8/openwrt-daede#70 (review, 2026-09-06 12:37Z).
+#
+#   The honest summary of what an opkg-side wrapper can and cannot
+#   do for the eBPF-leak problem (daeuniverse/dae#1092):
+#
+#     CAN do:                                        CANNOT do:
+#     reap daens netns                                detach pinned tc clsact filters
+#     reap dae0 veth pair                             delete /sys/fs/bpf/daed cleanly
+#     refuse to start a second daed (see
+#     daed-guard's pgrep check)
+#
+#   The pinned-tc-clsact fix has to land in daed's own graceful
+#   shutdown path (which is already the case — see
+#   dae/cmd/run.go:1035), or in a separate kernel-level cleanup
+#   helper. The opkg wrapper's job is to make sure the netns/veth
+#   state is clean and to make a stale eBPF situation visible in
+#   logread so an operator knows a reboot is required.
 #
 # Idempotent: re-running on a clean system is a no-op. Safe to call
 # while daed is running — every potentially-destructive step is
@@ -16,7 +45,7 @@
 # Companion to daed-guard: that wrapper calls daed_cleanup_runtime
 # before exec'ing the daemon (so any stale state from a previous
 # crashed run is reaped) and again after the daemon exits (so a
-# OOM-kill or kernel panic also leaves the dataplane clean).
+# OOM-kill or kernel panic also leaves the netns/veth clean).
 #
 # This script is a kenzok8/openwrt-daede-specific evolution of the
 # file originally shipped in daeuniverse/daed's `install/linux/`.
@@ -24,25 +53,28 @@
 # `procd init.d/daed` and the `daed-guard` wrapper can both
 # source it.
 
-_daed_is_running() {
-	pgrep -f "^/usr/bin/daed " >/dev/null 2>&1
-}
-
-_bpftool_available() {
-	command -v bpftool >/dev/null 2>&1
-}
-
 daed_cleanup_runtime() {
-	local pid p rc=0
+	local pid rc=0
 
 	# If daed userspace is currently running, do not touch the
 	# netns, the veth, or the eBPF dataplane. They are in active
 	# use; removing them would make every connection through dae
-	# hang. The wrapper calls us from a child wait context where
-	# the child is already gone, but procd init.d/daed can call us
-	# while the daemon is still alive (e.g. from `restart`), so
-	# the check is necessary.
-	if _daed_is_running; then
+	# hang.
+	if pgrep -f "^/usr/bin/daed " >/dev/null 2>&1; then
+		# Stale-child guard (P1-#6 in the Codex review on
+		# kenzok8/openwrt-daede#70): if we get here from
+		# daed-guard's pre-start cleanup, that means a previous
+		# wrapper run was killed and its /usr/bin/daed child
+		# outlived it. Returning 0 would let daed-guard
+		# proceed to start a SECOND daed against the same
+		# eBPF dataplane, which corrupts the kernel state.
+		# Returning 1 makes the wrapper refuse to start.
+		#
+		# daed-guard distinguishes the two contexts by
+		# checking whether $DAED_GUARD_CLEANUP is "start" or
+		# "post-exit". In the "post-exit" context the child
+		# is gone and this branch is unreachable.
+		[ "${DAED_GUARD_CLEANUP:-start}" = "start" ] && return 1
 		return 0
 	fi
 
@@ -78,66 +110,31 @@ daed_cleanup_runtime() {
 		fi
 	fi
 
-	# 4. Detach and remove pinned eBPF programs. Required because
-	#    daed 0.x closes its own eBPF objects only on a successful
-	#    non-reload Close; on unexpected exits (OOM-kill, kernel
-	#    panic, SIGHUP) the pinned programs stay attached to
-	#    br-lan ingress and keep hijacking traffic. See
-	#    https://github.com/daeuniverse/dae/issues/1092 for context.
+	# 4. /sys/fs/bpf/daed bpffs. The eBPF programs inside are
+	#    owned by the daed userspace process; if daed is not
+	#    running (we already checked above) the pinned
+	#    programs are no longer attached, but the bpffs
+	#    directory may still exist. Removing the directory
+	#    here only unlinks the bpffs inode; it does NOT
+	#    detach a TC clsact filter (see the file header for
+	#    the full explanation). If the eBPF leak we hit on
+	#    2026-09-06 09:37 has happened, the tc clsact filter
+	#    is still attached to br-lan ingress even after this
+	#    rm, and a reboot is the only safe recovery. We do
+	#    best-effort cleanup so an operator's manual `rm
+	#    /sys/fs/bpf/daed` is not required.
 	if [ -d /sys/fs/bpf/daed ]; then
-		if _bpftool_available; then
-			# Best-effort detach each pinned program. The
-			# `bpftool prog detach pinned <path>` form (no
-			# ATTACH_TYPE) is supported by iproute2's bpftool
-			# 5.x+ and is enough for the cleanup we need; it
-			# detaches from every attach point. The output is
-			# intentionally ignored (it is too verbose to be
-			# useful here).
-			for p in /sys/fs/bpf/daed/*/; do
-				[ -d "$p" ] || continue
-				if ! bpftool prog detach pinned "${p%/}" >/dev/null 2>&1; then
-					logger -t daed-init "cleanup: bpftool prog detach failed for ${p}; tc filter may still be attached to br-lan"
-					rc=1
-				fi
-			done
-		else
-			# bpftool not installed. We cannot guarantee the
-			# pinned programs are detached, so we MUST NOT rm
-			# the bpffs directory either — that would silently
-			# leave a leaked eBPF program hijacking traffic.
-			# Bail out non-zero so the operator knows they
-			# need to install bpftool-full or reboot.
-			#
-			# This is the path kenzok8 2026.08.21-r1 / 2026.08.28-r4
-			# take by default on stock OpenWrt, and is the
-			# reason the eBPF leak we hit on 2026-09-06 09:37
-			# persisted until the next reboot — see Codex
-			# review on kenzok8/openwrt-daede#70 (P1).
-			logger -t daed-init "cleanup: bpftool not found; cannot detach pinned eBPF programs. Install bpftool-full and re-run, or reboot. Skipping bpffs removal."
-			rc=1
-		fi
-
-		# 5. Remove the bpffs directory itself. Only safe when
-		#    every program above detached cleanly (or there were
-		#    none). If detach failed, the pinned programs are
-		#    still attached to br-lan; rm'ing the bpffs does
-		#    NOT un-attach them, and a final-verification check
-		#    that only looks at the filesystem would falsely
-		#    report success.
-		if [ "$rc" -eq 0 ]; then
-			if ! rm -rf /sys/fs/bpf/daed 2>/dev/null; then
-				logger -t daed-init "cleanup: failed to remove /sys/fs/bpf/daed"
-				rc=1
-			fi
+		if ! rm -rf /sys/fs/bpf/daed 2>/dev/null; then
+			logger -t daed-init "cleanup: /sys/fs/bpf/daed still present after rm; this is harmless but indicates the eBPF leak path. Reboot if traffic is hijacked."
 		fi
 	fi
 
-	# Final verification. If any of these four still exist the
+	# Final verification. If any of these three still exist the
 	# caller will see a non-zero exit and can decide to reboot.
+	# (We do NOT check /sys/fs/bpf/daed here — see file header.)
 	[ ! -e /run/netns/daens ] || return 1
 	! ip netns list 2>/dev/null | awk '$1 == "daens" { found=1 } END { exit !found }' || return 1
 	! ip link show dae0 >/dev/null 2>&1 || return 1
-	[ ! -e /sys/fs/bpf/daed ] || return 1
 
 	return $rc
 }

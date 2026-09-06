@@ -1,11 +1,18 @@
 #!/bin/sh
 # daed-guard — thin wrapper around /usr/bin/daed that ensures stale
-# kernel state (network namespace, veth pair, pinned eBPF programs)
-# is reaped before the daemon starts AND after it exits.
+# kernel state (network namespace, veth pair) is reaped before the
+# daemon starts AND after it exits.
+#
+# What this wrapper does NOT do (see daed-cleanup.sh for the full
+# explanation): detach the pinned eBPF tc clsact filter that daed
+# attaches to br-lan / dae0 ingress. That lives inside the daed
+# userspace process itself; the opkg-side wrapper can only
+# reap netns and veth. If daed is OOM-killed or panics, the
+# filter survives and only a reboot clears it.
 #
 # Two cleanup passes:
-#   - before exec: a stale run may have left daens / dae0 / bpf
-#     pinned from an OOM-kill or kernel panic. We reap first.
+#   - before exec: a stale run may have left daens / dae0 from an
+#     OOM-kill or kernel panic. We reap first.
 #   - after exit: a normal exit (including signal-induced ones)
 #     also reaps, so a partial state never survives.
 #
@@ -23,11 +30,18 @@
 
 . /usr/share/daed/cleanup.sh
 
-# 1. Stale-state cleanup before the daemon starts. If anything
-#    fails we abort early so the operator sees the error in
-#    logread.
+# Pre-start cleanup context. cleanup.sh uses this to refuse to
+# start a second daed if a previous /usr/bin/daed orphan is
+# still running (P1-#6 in the Codex review on
+# kenzok8/openwrt-daede#70).
+DAED_GUARD_CLEANUP=start
 if ! daed_cleanup_runtime; then
-	echo "daed: stale network state could not be removed" >&2
+	# A previous daed-guard run was killed and its /usr/bin/daed
+	# child outlived it, OR the daens netns is busy. Refuse to
+	# start a second daed — that would corrupt the eBPF
+	# dataplane. Operator must kill the orphan or reboot.
+	echo "daed: stale /usr/bin/daed or netns/bpf state could not be removed; refusing to start. Check 'pgrep -af /usr/bin/daed' and 'ip netns list'." >&2
+	logger -t daed-init "pre-start cleanup failed: refusing to start daed to avoid a second instance. Check ip netns list and pgrep -af /usr/bin/daed."
 	exit 1
 fi
 
@@ -78,13 +92,14 @@ status=$?
 child_pid=
 trap - TERM INT HUP QUIT
 
-# 3. Post-exit cleanup. If this fails we override the child's exit
-#    code to 1 so procd notices; an operator looking at the log
-#    will see both the kernel-state error and the original exit
-#    reason from dae.
+# 3. Post-exit cleanup. Switch to "post-exit" context so the
+#    pgrep check inside cleanup.sh does NOT refuse to run
+#    (the child is gone, but a real cleanup pass is still
+#    wanted in case the child's exit left stale netns/veth).
+DAED_GUARD_CLEANUP=post-exit
 if ! daed_cleanup_runtime; then
 	echo "daed: runtime cleanup after exit failed" >&2
-	logger -t daed-init "post-exit cleanup failed; check ip netns / bpf prog state"
+	logger -t daed-init "post-exit cleanup failed; check ip netns / ip link show"
 	status=1
 fi
 exit "$status"

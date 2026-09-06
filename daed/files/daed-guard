@@ -49,9 +49,30 @@ start_child() {
 	child_pid=$!
 }
 
-# Run the daemon. wait returns the child's exit code; preserve it
-# as the wrapper's exit so procd sees the right respawn counter.
+# Run the daemon. POSIX `wait` returns immediately when the
+# wrapper itself receives a signal (TERM/INT/HUP/QUIT), so a
+# single `wait "$child_pid"` would race: the trap fires and
+# forwards the signal, but `wait` returns with a signal-derived
+# status before the child has actually finished its graceful
+# shutdown. The wrapper would then run cleanup (which is a no-op
+# because the child is still running), exit, and procd would
+# spawn a SECOND daed while the first is still alive — two
+# daeds fighting over the same eBPF dataplane.
+#
+# To prevent that, use a polling loop: every time `wait` returns
+# because of a signal, the trap has already fired and the child
+# has been signalled. We loop and `wait` again until `kill -0`
+# confirms the child is actually gone. Then a final `wait` reaps
+# the child and gives us its real exit status.
+#
+# See Codex review on kenzok8/openwrt-daede#70 (P1) for the
+# bug-trigger trace.
 start_child "$@"
+while kill -0 "$child_pid" 2>/dev/null; do
+	wait "$child_pid" 2>/dev/null
+	# wait returned because of a signal; the trap fired and
+	# forwarded the signal to the child. Loop and wait again.
+done
 wait "$child_pid"
 status=$?
 child_pid=

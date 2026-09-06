@@ -5,11 +5,12 @@
 #   - log every branch via `logger -t daed-init` so silent procd
 #     failures (OOM-kill, kernel panic, abort-before-logger-init)
 #     leave a trail
-#   - bump respawn budget (3600 10 5) so a flapping validate step
-#     does not push daed into the "enabled/stopped" state within a
-#     single day
-#   - request procd_set_param oom_adj=-16 so the kernel OOM-killer
-#     prefers sibling processes over daed
+#   - bump respawn budget (3600 5 10 = threshold/timeout/retry, see
+#     comment in start_service) so a flapping validate step does not
+#     push daed into the "enabled/stopped" state within a single day
+#   - request `procd_set_param oom_adj -16` (note the space — two
+#     arguments) so the kernel OOM-killer prefers sibling processes
+#     over daed
 #   - stop_service() now reports the state of /sys/fs/bpf/daed and
 #     `ip netns list` so an operator can immediately see whether
 #     the dataplane was left attached (and needs a reboot) after
@@ -59,13 +60,25 @@ start_service() {
 
 	procd_set_param limits core="unlimited"
 	procd_set_param limits nofile="1000000 1000000"
-	# 10 attempts per hour is high enough to ride out a flapping
+	# procd_set_param respawn: arguments are (threshold, timeout, retry).
+	#   threshold = seconds in which to count retries (3600 = 1 hour)
+	#   timeout   = seconds to wait between retries
+	#   retry     = maximum number of restart attempts before procd
+	#               gives up and leaves the service in
+	#               "enabled/stopped".
+	# 10 retries per hour is high enough to ride out a flapping
 	# validate step, low enough that a permanently broken config
 	# still surfaces. (Upstream default is 5 — too low once we
 	# add a 5 s tail cleanup in a reload storm.)
-	procd_set_param respawn 3600 10 5
+	procd_set_param respawn 3600 5 10
 	# Tell the kernel OOM-killer to prefer other processes over daed.
-	procd_set_param oom_adj=-16
+	# IMPORTANT: procd_set_param takes TWO arguments here (the
+	# parameter name and its value), not one. Passing
+	# `procd_set_param oom_adj=-16` (one argument) makes procd see
+	# the entire string as an unknown parameter name and silently
+	# drop the directive. See Codex review on
+	# kenzok8/openwrt-daede#70.
+	procd_set_param oom_adj -16
 	# procd_set_param stdout 1
 	procd_set_param stderr 1
 

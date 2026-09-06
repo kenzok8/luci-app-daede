@@ -86,20 +86,49 @@ daed_cleanup_runtime() {
 	#    https://github.com/daeuniverse/dae/issues/1092 for context.
 	if [ -d /sys/fs/bpf/daed ]; then
 		if _bpftool_available; then
+			# Best-effort detach each pinned program. The
+			# `bpftool prog detach pinned <path>` form (no
+			# ATTACH_TYPE) is supported by iproute2's bpftool
+			# 5.x+ and is enough for the cleanup we need; it
+			# detaches from every attach point. The output is
+			# intentionally ignored (it is too verbose to be
+			# useful here).
 			for p in /sys/fs/bpf/daed/*/; do
 				[ -d "$p" ] || continue
-				bpftool prog detach pinned "${p%/}" 2>/dev/null || true
+				if ! bpftool prog detach pinned "${p%/}" >/dev/null 2>&1; then
+					logger -t daed-init "cleanup: bpftool prog detach failed for ${p}; tc filter may still be attached to br-lan"
+					rc=1
+				fi
 			done
 		else
-			logger -t daed-init "cleanup: bpftool not found; cannot detach pinned eBPF programs. Install bpftool-full and re-run, or reboot."
+			# bpftool not installed. We cannot guarantee the
+			# pinned programs are detached, so we MUST NOT rm
+			# the bpffs directory either — that would silently
+			# leave a leaked eBPF program hijacking traffic.
+			# Bail out non-zero so the operator knows they
+			# need to install bpftool-full or reboot.
+			#
+			# This is the path kenzok8 2026.08.21-r1 / 2026.08.28-r4
+			# take by default on stock OpenWrt, and is the
+			# reason the eBPF leak we hit on 2026-09-06 09:37
+			# persisted until the next reboot — see Codex
+			# review on kenzok8/openwrt-daede#70 (P1).
+			logger -t daed-init "cleanup: bpftool not found; cannot detach pinned eBPF programs. Install bpftool-full and re-run, or reboot. Skipping bpffs removal."
+			rc=1
 		fi
 
-		# 5. Remove the bpffs directory itself. Even if bpftool
-		#    detach failed, the kernel will let us rm a directory
-		#    that contains only detached programs.
-		if ! rm -rf /sys/fs/bpf/daed 2>/dev/null; then
-			logger -t daed-init "cleanup: failed to remove /sys/fs/bpf/daed"
-			rc=1
+		# 5. Remove the bpffs directory itself. Only safe when
+		#    every program above detached cleanly (or there were
+		#    none). If detach failed, the pinned programs are
+		#    still attached to br-lan; rm'ing the bpffs does
+		#    NOT un-attach them, and a final-verification check
+		#    that only looks at the filesystem would falsely
+		#    report success.
+		if [ "$rc" -eq 0 ]; then
+			if ! rm -rf /sys/fs/bpf/daed 2>/dev/null; then
+				logger -t daed-init "cleanup: failed to remove /sys/fs/bpf/daed"
+				rc=1
+			fi
 		fi
 	fi
 

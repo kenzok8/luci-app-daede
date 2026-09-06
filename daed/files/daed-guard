@@ -1,29 +1,69 @@
 #!/bin/sh
+# daed-guard — thin wrapper around /usr/bin/daed that ensures stale
+# kernel state (network namespace, veth pair, pinned eBPF programs)
+# is reaped before the daemon starts AND after it exits.
+#
+# Two cleanup passes:
+#   - before exec: a stale run may have left daens / dae0 / bpf
+#     pinned from an OOM-kill or kernel panic. We reap first.
+#   - after exit: a normal exit (including signal-induced ones)
+#     also reaps, so a partial state never survives.
+#
+# Signal handling:
+#   - TERM / INT / HUP / QUIT forwarded to the child so dae can
+#     run its own graceful shutdown (DetachBpfHooks + Close).
+#   - exit trap runs the post-exit cleanup unconditionally.
+#
+# This wrapper preserves the kenzok8/openwrt-daede convention of
+# backgrounding the child with `&` and `wait`ing on it, so the
+# wrapper itself stays around to do the post-exit cleanup. That
+# is more robust than the daeuniverse/daed reference (which uses
+# `exec`) because it lets us distinguish "child exited cleanly"
+# from "wrapper itself was signalled".
 
 . /usr/share/daed/cleanup.sh
 
+# 1. Stale-state cleanup before the daemon starts. If anything
+#    fails we abort early so the operator sees the error in
+#    logread.
 if ! daed_cleanup_runtime; then
 	echo "daed: stale network state could not be removed" >&2
 	exit 1
 fi
 
-# Keep daed as a child so a panic or unexpected exit is followed by an
-# immediate teardown of all kernel/runtime state before procd can respawn us.
+# 2. Keep daed as a child so a panic or unexpected exit is followed
+#    by an immediate teardown of all kernel/runtime state before
+#    procd can respawn us.
 child_pid=
-cleanup_child() {
+
+forward_signal() {
+	# Forward every terminating signal we receive to the child,
+	# so dae gets a chance to run its own graceful shutdown.
+	# EXIT is handled separately below.
 	[ -n "$child_pid" ] && kill "$child_pid" 2>/dev/null
 }
-trap cleanup_child TERM INT
+trap forward_signal TERM INT HUP QUIT
 
-/usr/bin/daed "$@" &
-child_pid=$!
+start_child() {
+	/usr/bin/daed "$@" &
+	child_pid=$!
+}
+
+# Run the daemon. wait returns the child's exit code; preserve it
+# as the wrapper's exit so procd sees the right respawn counter.
+start_child "$@"
 wait "$child_pid"
 status=$?
 child_pid=
-trap - TERM INT
+trap - TERM INT HUP QUIT
 
+# 3. Post-exit cleanup. If this fails we override the child's exit
+#    code to 1 so procd notices; an operator looking at the log
+#    will see both the kernel-state error and the original exit
+#    reason from dae.
 if ! daed_cleanup_runtime; then
 	echo "daed: runtime cleanup after exit failed" >&2
+	logger -t daed-init "post-exit cleanup failed; check ip netns / bpf prog state"
 	status=1
 fi
 exit "$status"

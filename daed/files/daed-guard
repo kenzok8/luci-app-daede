@@ -35,6 +35,11 @@
 # still running (P1-#6 in the Codex review on
 # kenzok8/openwrt-daede#70).
 DAED_GUARD_CLEANUP=start
+if [ -e /sys/fs/bpf/daed ]; then
+	echo "daed: /sys/fs/bpf/daed is still present; refusing to start. Retain the pins and reboot or clear kernel state manually." >&2
+	logger -t daed-init "pre-start blocked: /sys/fs/bpf/daed exists; retaining pins"
+	exit 1
+fi
 if ! daed_cleanup_runtime; then
 	# A previous daed-guard run was killed and its /usr/bin/daed
 	# child outlived it, OR the daens netns is busy. Refuse to
@@ -45,18 +50,29 @@ if ! daed_cleanup_runtime; then
 	exit 1
 fi
 
+if [ -e /sys/fs/bpf/daed ]; then
+	echo "daed: /sys/fs/bpf/daed appeared during pre-start cleanup; refusing to start." >&2
+	logger -t daed-init "pre-start blocked: /sys/fs/bpf/daed appeared; retaining pins"
+	exit 1
+fi
+
 # 2. Keep daed as a child so a panic or unexpected exit is followed
 #    by an immediate teardown of all kernel/runtime state before
 #    procd can respawn us.
 child_pid=
 
 forward_signal() {
-	# Forward every terminating signal we receive to the child,
-	# so dae gets a chance to run its own graceful shutdown.
-	# EXIT is handled separately below.
-	[ -n "$child_pid" ] && kill "$child_pid" 2>/dev/null
+	# Forward the same signal that hit the wrapper, not a bare
+	# kill (defaults to TERM). HUP/QUIT must stay HUP/QUIT so
+	# dae's graceful path sees the original intent. kenzok8
+	# review on kenzok8/openwrt-daede#70.
+	_sig="$1"
+	[ -n "$child_pid" ] && [ -n "$_sig" ] && kill -"$_sig" "$child_pid" 2>/dev/null
 }
-trap forward_signal TERM INT HUP QUIT
+trap 'forward_signal TERM' TERM
+trap 'forward_signal INT' INT
+trap 'forward_signal HUP' HUP
+trap 'forward_signal QUIT' QUIT
 
 start_child() {
 	/usr/bin/daed "$@" &
@@ -73,22 +89,31 @@ start_child() {
 # spawn a SECOND daed while the first is still alive — two
 # daeds fighting over the same eBPF dataplane.
 #
-# To prevent that, use a polling loop: every time `wait` returns
-# because of a signal, the trap has already fired and the child
-# has been signalled. We loop and `wait` again until `kill -0`
-# confirms the child is actually gone. Then a final `wait` reaps
-# the child and gives us its real exit status.
+# Poll until the child is gone. Each wait may return early on
+# signal; save its status. When wait actually reaps the child,
+# kill -0 fails and we break with that real exit code. Do NOT
+# issue an unconditional post-loop wait: ash then reports
+# "not a child" and status becomes 127. kenzok8 review on
+# kenzok8/openwrt-daede#70.
 #
-# See Codex review on kenzok8/openwrt-daede#70 (P1) for the
-# bug-trigger trace.
+# Best-effort OOM score before fork: procd_set_param has no
+# oom_adj case, so write /proc/self/oom_score_adj here; the
+# child inherits it. Failure must not block start.
+if ! echo -16 > /proc/self/oom_score_adj 2>/dev/null; then
+	logger -t daed-init "warn: failed to set /proc/self/oom_score_adj; continuing without OOM preference"
+fi
 start_child "$@"
-while kill -0 "$child_pid" 2>/dev/null; do
+status=0
+reaped=0
+while [ "$reaped" -eq 0 ]; do
 	wait "$child_pid" 2>/dev/null
-	# wait returned because of a signal; the trap fired and
-	# forwarded the signal to the child. Loop and wait again.
+	status=$?
+	# A failed kill -0 means wait reaped the child. Never wait
+	# again after that point; ash reports 127 for a reaped child.
+	if ! kill -0 "$child_pid" 2>/dev/null; then
+		reaped=1
+	fi
 done
-wait "$child_pid"
-status=$?
 child_pid=
 trap - TERM INT HUP QUIT
 
@@ -97,9 +122,13 @@ trap - TERM INT HUP QUIT
 #    (the child is gone, but a real cleanup pass is still
 #    wanted in case the child's exit left stale netns/veth).
 DAED_GUARD_CLEANUP=post-exit
-if ! daed_cleanup_runtime; then
+cleanup_status=0
+daed_cleanup_runtime || cleanup_status=$?
+if [ "$cleanup_status" -ne 0 ]; then
 	echo "daed: runtime cleanup after exit failed" >&2
 	logger -t daed-init "post-exit cleanup failed; check ip netns / ip link show"
-	status=1
 fi
-exit "$status"
+if [ "$status" -ne 0 ]; then
+	exit "$status"
+fi
+exit "$cleanup_status"

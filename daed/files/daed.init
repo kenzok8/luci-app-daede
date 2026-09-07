@@ -8,9 +8,10 @@
 #   - bump respawn budget (3600 5 10 = threshold/timeout/retry, see
 #     comment in start_service) so a flapping validate step does not
 #     push daed into the "enabled/stopped" state within a single day
-#   - request `procd_set_param oom_adj -16` (note the space — two
-#     arguments) so the kernel OOM-killer prefers sibling processes
-#     over daed
+#   - best-effort OOM preference is applied in daed-guard via
+#     /proc/self/oom_score_adj (procd has no oom_adj case — see
+#     start_service comment and daed-guard); do not use
+#     procd_set_param oom_adj here
 #   - stop_service() now reports the state of /sys/fs/bpf/daed and
 #     `ip netns list` so an operator can immediately see whether
 #     the dataplane was left attached (and needs a reboot) after
@@ -71,14 +72,12 @@ start_service() {
 	# still surfaces. (Upstream default is 5 — too low once we
 	# add a 5 s tail cleanup in a reload storm.)
 	procd_set_param respawn 3600 5 10
-	# Tell the kernel OOM-killer to prefer other processes over daed.
-	# IMPORTANT: procd_set_param takes TWO arguments here (the
-	# parameter name and its value), not one. Passing
-	# `procd_set_param oom_adj=-16` (one argument) makes procd see
-	# the entire string as an unknown parameter name and silently
-	# drop the directive. See Codex review on
+	# OOM preference is intentionally NOT set via procd_set_param.
+	# procd.sh has no oom_adj / oom_score_adj case; such a call is
+	# silently dropped and never reaches the kernel. daed-guard
+	# writes /proc/self/oom_score_adj before forking daed so the
+	# child inherits the score. See kenzok8 review on
 	# kenzok8/openwrt-daede#70.
-	procd_set_param oom_adj -16
 	# procd_set_param stdout 1
 	procd_set_param stderr 1
 
@@ -88,8 +87,13 @@ start_service() {
 
 stop_service() {
 	log "stop: begin"
-	# Report dataplane state so an operator can see if a reboot
-	# is needed before next start.
+	# Pre-stop dataplane snapshot only. Real netns/veth cleanup
+	# runs in daed-guard's post-exit path after the child exits.
+	# Calling daed_cleanup_runtime here while daed is still alive
+	# is a no-op (pgrep hits -> early return under
+	# DAED_GUARD_CLEANUP=start) and a "post-cleanup" log would
+	# falsely imply cleanup already ran. kenzok8 review on
+	# kenzok8/openwrt-daede#70.
 	local pinned="" ns_left=""
 	if [ -d /sys/fs/bpf/daed ]; then
 		pinned=$(ls /sys/fs/bpf/daed 2>/dev/null | tr '\n' ' ')
@@ -97,19 +101,7 @@ stop_service() {
 	if ip netns list 2>/dev/null | grep -q '^daens'; then
 		ns_left="daens"
 	fi
-	log "stop: pre-cleanup state — bpf_pinned=[${pinned:-none}] netns_left=[${ns_left:-none}]"
-
-	daed_cleanup_runtime
-
-	pinned=""
-	ns_left=""
-	if [ -d /sys/fs/bpf/daed ]; then
-		pinned=$(ls /sys/fs/bpf/daed 2>/dev/null | tr '\n' ' ')
-	fi
-	if ip netns list 2>/dev/null | grep -q '^daens'; then
-		ns_left="daens"
-	fi
-	log "stop: post-cleanup state — bpf_pinned=[${pinned:-none}] netns_left=[${ns_left:-none}]"
+	log "stop: pre-stop state — bpf_pinned=[${pinned:-none}] netns_left=[${ns_left:-none}]"
 }
 
 restart() {

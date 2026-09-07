@@ -110,23 +110,14 @@ daed_cleanup_runtime() {
 		fi
 	fi
 
-	# 4. /sys/fs/bpf/daed bpffs. The eBPF programs inside are
-	#    owned by the daed userspace process; if daed is not
-	#    running (we already checked above) the pinned
-	#    programs are no longer attached, but the bpffs
-	#    directory may still exist. Removing the directory
-	#    here only unlinks the bpffs inode; it does NOT
-	#    detach a TC clsact filter (see the file header for
-	#    the full explanation). If the eBPF leak we hit on
-	#    2026-09-06 09:37 has happened, the tc clsact filter
-	#    is still attached to br-lan ingress even after this
-	#    rm, and a reboot is the only safe recovery. We do
-	#    best-effort cleanup so an operator's manual `rm
-	#    /sys/fs/bpf/daed` is not required.
-	if [ -d /sys/fs/bpf/daed ]; then
-		if ! rm -rf /sys/fs/bpf/daed 2>/dev/null; then
-			logger -t daed-init "cleanup: /sys/fs/bpf/daed still present after rm; this is harmless but indicates the eBPF leak path. Reboot if traffic is hijacked."
-		fi
+	# 4. /sys/fs/bpf/daed is intentionally never removed here.
+	#    Pinned eBPF state may still represent an attached TC
+	#    clsact filter; unlinking it cannot detach that filter.
+	#    Retain the pins, log a diagnostic, and fail so the
+	#    pre-start guard blocks a second daemon.
+	if [ -e /sys/fs/bpf/daed ]; then
+		logger -t daed-init "cleanup: retaining /sys/fs/bpf/daed; pinned eBPF state requires manual recovery or reboot"
+		rc=1
 	fi
 
 	# Final verification. If any of these three still exist the

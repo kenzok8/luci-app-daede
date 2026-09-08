@@ -1,5 +1,23 @@
 #!/bin/sh /etc/rc.common
 # Copyright (C) 2023 Tianling Shen <cnsztl@immortalwrt.org>
+#
+# Improvements in this revision:
+#   - log every branch via `logger -t daed-init` so silent procd
+#     failures (OOM-kill, kernel panic, abort-before-logger-init)
+#     leave a trail
+#   - bump respawn budget (3600 5 10 = threshold/timeout/retry, see
+#     comment in start_service) so a flapping validate step does not
+#     push daed into the "enabled/stopped" state within a single day
+#   - best-effort OOM preference is applied in daed-guard via
+#     /proc/self/oom_score_adj (procd has no oom_adj case — see
+#     start_service comment and daed-guard); do not use
+#     procd_set_param oom_adj here
+#   - stop_service() now reports the state of /sys/fs/bpf/daed and
+#     `ip netns list` so an operator can immediately see whether
+#     the dataplane was left attached (and needs a reboot) after
+#     a manual stop
+#   - drop the `rm -f "$LOG"` in stop_service so post-mortem logs
+#     survive a manual stop
 
 USE_PROCD=1
 START=99
@@ -10,17 +28,27 @@ LOG="/var/log/daed/daed.log"
 
 . /usr/share/daed/cleanup.sh
 
+log() {
+	logger -t daed-init "$@"
+}
+
 start_service() {
+	log "start: begin"
 	config_load "$CONF"
 
 	local enabled
 	config_get_bool enabled "config" "enabled" "0"
-	[ "$enabled" -eq "1" ] || return 1
+	if [ "$enabled" -ne "1" ]; then
+		log "start: config disabled, exit"
+		return 1
+	fi
 
 	local listen_addr log_maxbackups log_maxsize
 	config_get listen_addr "config" "listen_addr" "0.0.0.0:2023"
 	config_get log_maxbackups "config" "log_maxbackups" "1"
 	config_get log_maxsize "config" "log_maxsize" "5"
+
+	log "start: listen=$listen_addr log_maxbackups=$log_maxbackups log_maxsize=$log_maxsize"
 
 	procd_open_instance "$CONF"
 	procd_set_param env DAE_LOCATION_ASSET="/usr/share/v2ray" TZ="$(uci -q get system.@system[0].zonename)"
@@ -33,24 +61,58 @@ start_service() {
 
 	procd_set_param limits core="unlimited"
 	procd_set_param limits nofile="1000000 1000000"
-	# Avoid an endless crash/respawn loop which can repeatedly reattach dae's
-	# data-plane hooks and make the router management plane unreachable.
-	procd_set_param respawn 3600 5 5
+	# Give daed time to detach hooks and let daed-guard reap its child.
+	procd_set_param term_timeout 20
+	# procd_set_param respawn: arguments are (threshold, timeout, retry).
+	#   threshold = seconds in which to count retries (3600 = 1 hour)
+	#   timeout   = seconds to wait between retries
+	#   retry     = maximum number of restart attempts before procd
+	#               gives up and leaves the service in
+	#               "enabled/stopped".
+	# 10 retries per hour is high enough to ride out a flapping
+	# validate step, low enough that a permanently broken config
+	# still surfaces. (Upstream default is 5 — too low once we
+	# add a 5 s tail cleanup in a reload storm.)
+	procd_set_param respawn 3600 5 10
+	# OOM preference is intentionally NOT set via procd_set_param.
+	# procd.sh has no oom_adj / oom_score_adj case; such a call is
+	# silently dropped and never reaches the kernel. daed-guard
+	# writes /proc/self/oom_score_adj before forking daed so the
+	# child inherits the score. See kenzok8 review on
+	# kenzok8/openwrt-daede#70.
 	# procd_set_param stdout 1
 	procd_set_param stderr 1
 
 	procd_close_instance
+	log "start: procd_open_instance done"
 }
 
 stop_service() {
-	rm -f "$LOG"
-	daed_cleanup_runtime
+	log "stop: begin"
+	# Pre-stop dataplane snapshot only. Real netns/veth cleanup
+	# runs in daed-guard's post-exit path after the child exits.
+	# Calling daed_cleanup_runtime here while daed is still alive
+	# is a no-op (pgrep hits -> early return under
+	# DAED_GUARD_CLEANUP=start) and a "post-cleanup" log would
+	# falsely imply cleanup already ran. kenzok8 review on
+	# kenzok8/openwrt-daede#70.
+	local pinned="" ns_left=""
+	if [ -d /sys/fs/bpf/daed ]; then
+		pinned=$(ls /sys/fs/bpf/daed 2>/dev/null | tr '\n' ' ')
+	fi
+	if ip netns list 2>/dev/null | grep -q '^daens'; then
+		ns_left="daens"
+	fi
+	log "stop: pre-stop state — bpf_pinned=[${pinned:-none}] netns_left=[${ns_left:-none}]"
 }
 
 restart() {
+	log "restart: stop"
 	stop
 	sleep 1
+	log "restart: cleanup"
 	daed_cleanup_runtime
+	log "restart: start"
 	start
 }
 

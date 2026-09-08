@@ -1,0 +1,17 @@
+diff --git a/transport/tls/reality.go b/transport/tls/reality.go
+index 756a749..bb58754 100644
+--- a/transport/tls/reality.go
++++ b/transport/tls/reality.go
+@@ -41,9 +41,9 @@ import (
+ )
+ 
+ var (
+-	Reality_Version_x byte = 1
+-	Reality_Version_y byte = 8
+-	Reality_Version_z byte = 10
++	Reality_Version_x byte = 26
++	Reality_Version_y byte = 7
++	Reality_Version_z byte = 28
+ )
+ 
+ //go:linkname aesgcmPreferred github.com/refraction-networking/utls.aesgcmPreferred

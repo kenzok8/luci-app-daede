@@ -22,18 +22,20 @@ fix onto this lineage.
 
 ## Self-owned patches that must survive every sync
 
-The repository currently carries 17 patch files:
+The repository currently carries 18 patch files:
 
 - `dae/patches`: 1 regular dae patch.
 - `dae/patches_arm`: 2 ARM32 compatibility patches.
 - `daed/patches`: 11 daed reliability and update patches.
 - `daed/patches_arm`: 2 ARM32 compatibility patches for the embedded dae core.
-- `ci/patches/outbound`: 1 SSR buffered-reader fix.
+- `ci/patches/outbound`: 2 patches (SSR buffered-reader fix + temporary REALITY
+  client-version bump for Xray-core 26.7.x, see `ci/patches/outbound/README.md`).
 - `ci/patches/quic-go`: currently empty; retained for future backports.
 
-On 2026-08-28 every patch was checked against the pinned upstream source. None
-was equivalently absorbed, and all 17 remain required. In particular, outbound
-still lacks the SSR `unwrapConn` fix.
+On 2026-08-28 every patch then present was checked against the pinned upstream
+source. None was equivalently absorbed, and all of them remain required. In
+particular, outbound still lacks the SSR `unwrapConn` fix and a native REALITY
+version-byte strategy.
 
 The `patch-absorbed` job in `auto-bump.yml` checks every regular, ARM, outbound
 and quic-go patch in package order. It reports a patch when reverse apply starts
@@ -59,7 +61,7 @@ upstream before deleting a reported local patch.
 5. After the mirror and patch audit succeed, update `OUTBOUND_COMMIT`,
    `QUICGO_BASE_COMMIT` and `QUICGO_PERF_TIP` together in `ci/pins.env`.
 6. For outbound, apply `ci/patches/outbound/*.patch` and run
-   `go test ./protocol/shadowsocks_stream/`.
+   `go test ./protocol/shadowsocks_stream/ ./transport/tls/`.
 7. For quic-go, apply any `ci/patches/quic-go/*.patch` and run `go build ./...`.
 8. On a staging branch, run both assemble workflows and all four gate build
    combinations (2 SDK versions × 2 architectures). Promote to `main` only

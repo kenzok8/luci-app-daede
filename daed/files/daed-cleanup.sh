@@ -60,21 +60,23 @@ daed_cleanup_runtime() {
 	# netns, the veth, or the eBPF dataplane. They are in active
 	# use; removing them would make every connection through dae
 	# hang.
-	if pgrep -f "^/usr/bin/daed " >/dev/null 2>&1; then
-		# Stale-child guard (P1-#6 in the Codex review on
-		# kenzok8/openwrt-daede#70): if we get here from
-		# daed-guard's pre-start cleanup, that means a previous
-		# wrapper run was killed and its /usr/bin/daed child
-		# outlived it. Returning 0 would let daed-guard
-		# proceed to start a SECOND daed against the same
-		# eBPF dataplane, which corrupts the kernel state.
-		# Returning 1 makes the wrapper refuse to start.
-		#
-		# daed-guard distinguishes the two contexts by
-		# checking whether $DAED_GUARD_CLEANUP is "start" or
-		# "post-exit". In the "post-exit" context the child
-		# is gone and this branch is unreachable.
-		[ "${DAED_GUARD_CLEANUP:-start}" = "start" ] && return 1
+	if pgrep -f '^/usr/bin/daed([[:space:]]|$)' >/dev/null 2>&1; then
+		if [ "${DAED_GUARD_CLEANUP:-start}" = "start" ]; then
+			# Stale-child guard (P1-#6 in the Codex review on
+			# kenzok8/openwrt-daede#70): if we get here from
+			# daed-guard's pre-start cleanup, a previous wrapper
+			# was killed and its /usr/bin/daed child outlived it.
+			# Returning 1 makes the wrapper refuse to start a
+			# SECOND daed against the same eBPF dataplane.
+			logger -t daed-init "cleanup: pre-start skipped because /usr/bin/daed is still running; refusing a second instance"
+			return 1
+		fi
+
+		# A different daed instance may still be alive during a
+		# post-exit cleanup (for example, while procd is handling a
+		# stale wrapper). Do not touch its runtime state, but make
+		# the reason visible instead of silently reporting success.
+		logger -t daed-init "cleanup: post-exit skipped because another /usr/bin/daed instance is still running"
 		return 0
 	fi
 

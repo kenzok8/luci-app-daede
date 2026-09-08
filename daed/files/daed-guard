@@ -60,6 +60,7 @@ fi
 #    by an immediate teardown of all kernel/runtime state before
 #    procd can respawn us.
 child_pid=
+pending_signal=
 
 forward_signal() {
 	# Forward the same signal that hit the wrapper, not a bare
@@ -67,7 +68,15 @@ forward_signal() {
 	# dae's graceful path sees the original intent. kenzok8
 	# review on kenzok8/openwrt-daede#70.
 	_sig="$1"
-	[ -n "$child_pid" ] && [ -n "$_sig" ] && kill -"$_sig" "$child_pid" 2>/dev/null
+	if [ -z "$child_pid" ]; then
+		# The trap is installed before start_child. Remember a stop
+		# signal received in that window so the daemon is never
+		# launched after the wrapper has already been asked to stop.
+		pending_signal="$_sig"
+		logger -t daed-init "signal $_sig received before daed child started; launch cancelled"
+		return 0
+	fi
+	[ -n "$_sig" ] && kill -"$_sig" "$child_pid" 2>/dev/null
 }
 trap 'forward_signal TERM' TERM
 trap 'forward_signal INT' INT
@@ -75,9 +84,24 @@ trap 'forward_signal HUP' HUP
 trap 'forward_signal QUIT' QUIT
 
 start_child() {
+	# Keep this check inside the function as well as at the call site:
+	# it closes the ordinary pre-start window, while the pending-signal
+	# path below handles a signal arriving during the background fork.
+	[ -z "$pending_signal" ] || return 125
 	/usr/bin/daed "$@" &
 	child_pid=$!
+	if [ -n "$pending_signal" ]; then
+		_sig="$pending_signal"
+		pending_signal=
+		forward_signal "$_sig"
+	fi
 }
+
+if [ -n "$pending_signal" ]; then
+	logger -t daed-init "refusing to start daed after pending signal $pending_signal"
+	trap - TERM INT HUP QUIT
+	exit 1
+fi
 
 # Run the daemon. POSIX `wait` returns immediately when the
 # wrapper itself receives a signal (TERM/INT/HUP/QUIT), so a
@@ -102,7 +126,11 @@ start_child() {
 if ! echo -16 > /proc/self/oom_score_adj 2>/dev/null; then
 	logger -t daed-init "warn: failed to set /proc/self/oom_score_adj; continuing without OOM preference"
 fi
-start_child "$@"
+if ! start_child "$@"; then
+	logger -t daed-init "refusing to start daed after pending signal $pending_signal"
+	trap - TERM INT HUP QUIT
+	exit 1
+fi
 status=0
 reaped=0
 while [ "$reaped" -eq 0 ]; do

@@ -4,11 +4,12 @@ Fixes we carry on top of `OUTBOUND_COMMIT` because upstream has not merged them.
 The assemble workflows apply every `NNNN-*.patch` here with `git apply` right
 after fetching outbound; an empty directory is skipped.
 
-## Current state: one patch
+## Current state: two patches
 
 | patch | what | why it is here |
 |-------|------|----------------|
 | 0001 | SSR obfs reaches its cipher through `BufferedReaderConn` | fixes every SSR handshake; olicesx never merged it into `perf/complete-optimizations` |
+| 0002 | REALITY client sends version bytes `[26,7,28]` instead of `[1,8,10]` | Xray-core 26.7.11+ defaults the server's `minClientVer` to `26.3.27`, so our version bytes are rejected; see below |
 
 ### 0001 background
 
@@ -17,6 +18,28 @@ asserting on the underlying conn. A TCP read-buffering change wrapped that conn
 in `netproxy.BufferedReaderConn`, so both assertions stopped matching and every
 SSR handshake failed with `outer conn did not init cipher of Obfs` (issue #52).
 The fix peels transparent wrappers via the existing `IntrinsicConn` accessor.
+
+### 0002 background
+
+The REALITY client writes its own three version bytes into the encrypted
+handshake. Xray-core 26.7.11+ (commit `af7eb68`) defaults the server's
+`realitySettings.minClientVer` to `26.3.27` when unset, so every 26.7.x server
+rejects dae/daed REALITY connections into the fallback decoy
+(`REALITY: processed invalid connection`). Sending `[26,7,28]` passes any
+current default gate. This is a temporary compatibility measure, not a protocol
+requirement:
+
+- Xray-core main has already reverted the default gate in commit `47cfe999`,
+  but no release carries that change yet, and 26.7.x servers already deployed
+  keep it.
+- Re-evaluate (and delete) this patch only when outbound itself adopts an
+  appropriate version-byte strategy, or when the project's compatibility scope
+  explicitly drops 26.7.x servers — not merely because a newer Xray release
+  appears. A server operator can still reject us by explicitly configuring a
+  lower `maxClientVer`; that is their choice and nothing on our side fixes it.
+
+The REALITY protocol library is identical between Xray-core 26.3.27 and
+26.7.28, so patched clients remain fully compatible with older servers.
 
 The fix exists upstream as a side commit (`d5d9708`, later rebased to
 `5797872`) that was never merged into the perf branch we track. Pinning

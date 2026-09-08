@@ -7,78 +7,57 @@
 #      umount+rm as fallback for zombie nsfs mounts)
 #   3. The `dae0` veth pair in the host netns
 #
-# What this script intentionally does NOT do:
+# daed itself owns TC clsact detach. This opkg-side helper only
+# reaps stale daens/dae0 state and never removes /sys/fs/bpf/daed.
+# The pin directory is created during normal startup, so it is not
+# a reliable leak indicator and must not block service lifecycle.
 #
-#   It does NOT try to detach the eBPF tc clsact filter that daed
-#   pins on br-lan / dae0 ingress. The detach path lives inside
-#   the daed userspace process itself (`ControlPlane.DetachBpfHooks`
-#   → `netlink.FilterDel` / `tc qdisc del dev <iface> clsact`,
-#   control/control_plane_core.go:228, control/bpf_purge.go:30-41).
-#   `bpftool prog detach` is the wrong tool: it only handles the
-#   attach types the kernel exposes through bpf_iter / bpf_link
-#   (sk_msg_verdict, sk_skb_verdict, sk_skb_stream_verdict,
-#   sk_skb_stream_parser, flow_dissector), and daed's hooks are
-#   attached via `netlink.FilterAdd` as TC clsact filters, which
-#   are not on that list. kenzok8 confirmed this on PR
-#   kenzok8/openwrt-daede#70 (review, 2026-09-06 12:37Z).
-#
-#   The honest summary of what an opkg-side wrapper can and cannot
-#   do for the eBPF-leak problem (daeuniverse/dae#1092):
-#
-#     CAN do:                                        CANNOT do:
-#     reap daens netns                                detach pinned tc clsact filters
-#     reap dae0 veth pair                             delete /sys/fs/bpf/daed cleanly
-#     refuse to start a second daed (see
-#     daed-guard's pgrep check)
-#
-#   The pinned-tc-clsact fix has to land in daed's own graceful
-#   shutdown path (which is already the case — see
-#   dae/cmd/run.go:1035), or in a separate kernel-level cleanup
-#   helper. The opkg wrapper's job is to make sure the netns/veth
-#   state is clean and to make a stale eBPF situation visible in
-#   logread so an operator knows a reboot is required.
-#
-# Idempotent: re-running on a clean system is a no-op. Safe to call
-# while daed is running — every potentially-destructive step is
-# guarded by a `pgrep -f /usr/bin/daed` check.
-#
-# Companion to daed-guard: that wrapper calls daed_cleanup_runtime
-# before exec'ing the daemon (so any stale state from a previous
-# crashed run is reaped) and again after the daemon exits (so a
-# OOM-kill or kernel panic also leaves the netns/veth clean).
-#
-# This script is a kenzok8/openwrt-daede-specific evolution of the
-# file originally shipped in daeuniverse/daed's `install/linux/`.
-# It must remain a single function (`daed_cleanup_runtime`) so the
-# `procd init.d/daed` and the `daed-guard` wrapper can both
-# source it.
+# The function stays sourceable by both init.d/daed and daed-guard.
+
+daed_process_probe() {
+	if command -v pgrep >/dev/null 2>&1; then
+		pgrep -f '^/usr/bin/daed([[:space:]]|$)' >/dev/null 2>&1
+		case "$?" in
+			0) return 0 ;;
+			1) return 1 ;;
+		esac
+	fi
+
+	if command -v pidof >/dev/null 2>&1; then
+		pidof daed >/dev/null 2>&1
+		case "$?" in
+			0) return 0 ;;
+			1) return 1 ;;
+		esac
+	fi
+
+	return 2
+}
 
 daed_cleanup_runtime() {
-	local pid rc=0
+	local pid rc=0 probe_rc
 
 	# If daed userspace is currently running, do not touch the
 	# netns, the veth, or the eBPF dataplane. They are in active
 	# use; removing them would make every connection through dae
 	# hang.
-	if pgrep -f '^/usr/bin/daed([[:space:]]|$)' >/dev/null 2>&1; then
+	daed_process_probe
+	probe_rc=$?
+	case "$probe_rc" in
+	0)
 		if [ "${DAED_GUARD_CLEANUP:-start}" = "start" ]; then
-			# Stale-child guard (P1-#6 in the Codex review on
-			# kenzok8/openwrt-daede#70): if we get here from
-			# daed-guard's pre-start cleanup, a previous wrapper
-			# was killed and its /usr/bin/daed child outlived it.
-			# Returning 1 makes the wrapper refuse to start a
-			# SECOND daed against the same eBPF dataplane.
 			logger -t daed-init "cleanup: pre-start skipped because /usr/bin/daed is still running; refusing a second instance"
 			return 1
 		fi
-
-		# A different daed instance may still be alive during a
-		# post-exit cleanup (for example, while procd is handling a
-		# stale wrapper). Do not touch its runtime state, but make
-		# the reason visible instead of silently reporting success.
 		logger -t daed-init "cleanup: post-exit skipped because another /usr/bin/daed instance is still running"
 		return 0
-	fi
+		;;
+	1) ;;
+	*)
+		logger -t daed-init "cleanup: cannot determine whether daed is running; refusing to remove netns/veth"
+		return 1
+		;;
+	esac
 
 	# 1. Kill processes inside daens.
 	for pid in $(ip netns pids daens 2>/dev/null); do
@@ -112,21 +91,15 @@ daed_cleanup_runtime() {
 		fi
 	fi
 
-	# 4. /sys/fs/bpf/daed is intentionally never removed here.
-	#    Pinned eBPF state may still represent an attached TC
-	#    clsact filter; unlinking it cannot detach that filter.
-	#    Retain the pins, log a diagnostic, and fail so the
-	#    pre-start guard blocks a second daemon.
+	# 4. The pin root is normal persistent state. Never remove it or
+	#    make its existence change the cleanup result.
 	if [ -e /sys/fs/bpf/daed ]; then
-		logger -t daed-init "cleanup: retaining /sys/fs/bpf/daed; pinned eBPF state requires manual recovery or reboot"
-		rc=1
+		logger -t daed-init "cleanup: /sys/fs/bpf/daed exists; leaving normal pin root unchanged"
 	fi
 
-	# Final verification. If any of these three still exist the
-	# caller will see a non-zero exit and can decide to reboot.
-	# (We do NOT check /sys/fs/bpf/daed here — see file header.)
+	# Final verification covers only netns and veth state.
 	[ ! -e /run/netns/daens ] || return 1
-	! ip netns list 2>/dev/null | awk '$1 == "daens" { found=1 } END { exit !found }' || return 1
+	! ip netns list 2>/dev/null | grep -Eq '^daens([[:space:]]|$)' || return 1
 	! ip link show dae0 >/dev/null 2>&1 || return 1
 
 	return $rc

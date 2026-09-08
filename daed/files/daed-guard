@@ -3,12 +3,8 @@
 # kernel state (network namespace, veth pair) is reaped before the
 # daemon starts AND after it exits.
 #
-# What this wrapper does NOT do (see daed-cleanup.sh for the full
-# explanation): detach the pinned eBPF tc clsact filter that daed
-# attaches to br-lan / dae0 ingress. That lives inside the daed
-# userspace process itself; the opkg-side wrapper can only
-# reap netns and veth. If daed is OOM-killed or panics, the
-# filter survives and only a reboot clears it.
+# The wrapper only reaps stale netns/veth state. daed itself owns
+# TC clsact detach; /sys/fs/bpf/daed is normal persistent pin state.
 #
 # Two cleanup passes:
 #   - before exec: a stale run may have left daens / dae0 from an
@@ -30,53 +26,35 @@
 
 . /usr/share/daed/cleanup.sh
 
-# Pre-start cleanup context. cleanup.sh uses this to refuse to
-# start a second daed if a previous /usr/bin/daed orphan is
-# still running (P1-#6 in the Codex review on
-# kenzok8/openwrt-daede#70).
+# Pre-start cleanup refuses to remove runtime state while another
+# daed instance is active, and fails closed if that probe is broken.
 DAED_GUARD_CLEANUP=start
-if [ -e /sys/fs/bpf/daed ]; then
-	echo "daed: /sys/fs/bpf/daed is still present; refusing to start. Retain the pins and reboot or clear kernel state manually." >&2
-	logger -t daed-init "pre-start blocked: /sys/fs/bpf/daed exists; retaining pins"
-	exit 1
-fi
 if ! daed_cleanup_runtime; then
-	# A previous daed-guard run was killed and its /usr/bin/daed
-	# child outlived it, OR the daens netns is busy. Refuse to
-	# start a second daed — that would corrupt the eBPF
-	# dataplane. Operator must kill the orphan or reboot.
-	echo "daed: stale /usr/bin/daed or netns/bpf state could not be removed; refusing to start. Check 'pgrep -af /usr/bin/daed' and 'ip netns list'." >&2
-	logger -t daed-init "pre-start cleanup failed: refusing to start daed to avoid a second instance. Check ip netns list and pgrep -af /usr/bin/daed."
+	echo "daed: stale /usr/bin/daed or netns state could not be verified or removed; refusing to start. Check process and netns state." >&2
+	logger -t daed-init "pre-start cleanup failed: refusing to start daed"
 	exit 1
 fi
 
-if [ -e /sys/fs/bpf/daed ]; then
-	echo "daed: /sys/fs/bpf/daed appeared during pre-start cleanup; refusing to start." >&2
-	logger -t daed-init "pre-start blocked: /sys/fs/bpf/daed appeared; retaining pins"
-	exit 1
-fi
-
-# 2. Keep daed as a child so a panic or unexpected exit is followed
-#    by an immediate teardown of all kernel/runtime state before
-#    procd can respawn us.
+# Keep daed as a child so post-exit cleanup runs before procd can
+# respawn it.
 child_pid=
 pending_signal=
 
 forward_signal() {
-	# Forward the same signal that hit the wrapper, not a bare
-	# kill (defaults to TERM). HUP/QUIT must stay HUP/QUIT so
-	# dae's graceful path sees the original intent. kenzok8
-	# review on kenzok8/openwrt-daede#70.
 	_sig="$1"
 	if [ -z "$child_pid" ]; then
-		# The trap is installed before start_child. Remember a stop
-		# signal received in that window so the daemon is never
-		# launched after the wrapper has already been asked to stop.
 		pending_signal="$_sig"
 		logger -t daed-init "signal $_sig received before daed child started; launch cancelled"
 		return 0
 	fi
 	[ -n "$_sig" ] && kill -"$_sig" "$child_pid" 2>/dev/null
+}
+
+exit_with_signal() {
+	_sig="$1"
+	trap - TERM INT HUP QUIT
+	kill -"$_sig" "$$" 2>/dev/null
+	exit 1
 }
 trap 'forward_signal TERM' TERM
 trap 'forward_signal INT' INT
@@ -99,36 +77,18 @@ start_child() {
 
 if [ -n "$pending_signal" ]; then
 	logger -t daed-init "refusing to start daed after pending signal $pending_signal"
-	trap - TERM INT HUP QUIT
-	exit 1
+	exit_with_signal "$pending_signal"
 fi
 
-# Run the daemon. POSIX `wait` returns immediately when the
-# wrapper itself receives a signal (TERM/INT/HUP/QUIT), so a
-# single `wait "$child_pid"` would race: the trap fires and
-# forwards the signal, but `wait` returns with a signal-derived
-# status before the child has actually finished its graceful
-# shutdown. The wrapper would then run cleanup (which is a no-op
-# because the child is still running), exit, and procd would
-# spawn a SECOND daed while the first is still alive — two
-# daeds fighting over the same eBPF dataplane.
-#
-# Poll until the child is gone. Each wait may return early on
-# signal; save its status. When wait actually reaps the child,
-# kill -0 fails and we break with that real exit code. Do NOT
-# issue an unconditional post-loop wait: ash then reports
-# "not a child" and status becomes 127. kenzok8 review on
-# kenzok8/openwrt-daede#70.
-#
-# Best-effort OOM score before fork: procd_set_param has no
-# oom_adj case, so write /proc/self/oom_score_adj here; the
-# child inherits it. Failure must not block start.
+# Best-effort OOM preference; failure must not block startup.
 if ! echo -16 > /proc/self/oom_score_adj 2>/dev/null; then
 	logger -t daed-init "warn: failed to set /proc/self/oom_score_adj; continuing without OOM preference"
 fi
 if ! start_child "$@"; then
 	logger -t daed-init "refusing to start daed after pending signal $pending_signal"
-	trap - TERM INT HUP QUIT
+	if [ -n "$pending_signal" ]; then
+		exit_with_signal "$pending_signal"
+	fi
 	exit 1
 fi
 status=0
@@ -136,8 +96,6 @@ reaped=0
 while [ "$reaped" -eq 0 ]; do
 	wait "$child_pid" 2>/dev/null
 	status=$?
-	# A failed kill -0 means wait reaped the child. Never wait
-	# again after that point; ash reports 127 for a reaped child.
 	if ! kill -0 "$child_pid" 2>/dev/null; then
 		reaped=1
 	fi
@@ -145,10 +103,7 @@ done
 child_pid=
 trap - TERM INT HUP QUIT
 
-# 3. Post-exit cleanup. Switch to "post-exit" context so the
-#    pgrep check inside cleanup.sh does NOT refuse to run
-#    (the child is gone, but a real cleanup pass is still
-#    wanted in case the child's exit left stale netns/veth).
+# Post-exit cleanup runs after the child is reaped.
 DAED_GUARD_CLEANUP=post-exit
 cleanup_status=0
 daed_cleanup_runtime || cleanup_status=$?

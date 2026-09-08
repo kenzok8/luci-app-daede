@@ -61,6 +61,8 @@ start_service() {
 
 	procd_set_param limits core="unlimited"
 	procd_set_param limits nofile="1000000 1000000"
+	# Give daed time to detach hooks and let daed-guard reap its child.
+	procd_set_param term_timeout 20
 	# procd_set_param respawn: arguments are (threshold, timeout, retry).
 	#   threshold = seconds in which to count retries (3600 = 1 hour)
 	#   timeout   = seconds to wait between retries
